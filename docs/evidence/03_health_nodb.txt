@@ -1,0 +1,10 @@
+$ gunicorn --bind 0.0.0.0:8000 app:app   # app started (no database reachable)
+$ curl -i http://127.0.0.1:8000/health
+HTTP/1.1 503 SERVICE UNAVAILABLE
+Content-Type: application/json
+Content-Length: 57
+
+{"database":"down","status":"degraded","version":"demo"}
+
+$ curl -s http://127.0.0.1:8000/
+<h1>Capstone: Automated Cloud Deployment Pipeline</h1><p>Version: <b>demo</b></p><ul><li><a href='/health'>/health</a></li><li><a href='/api/notes'>/api/notes</a></li></ul>

@@ -1,0 +1,174 @@
+name: CI/CD - Test, Build, Provision, Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]      # PRs only run the test job
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'af-south-1' }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'capstone-app' }}
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false      # never kill a running terraform apply
+
+permissions:
+  contents: read
+
+jobs:
+  # ------------------------------------------------------------------ 1
+  test:
+    name: Lint & unit tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: app/requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Lint (flake8)
+        run: flake8
+      - name: Unit tests (pytest)
+        run: pytest -v
+
+  # ------------------------------------------------------------------ 2
+  build-and-push:
+    name: Build & push image to ECR
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: login
+        uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v3
+      - id: meta
+        run: echo "image=${{ steps.login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - name: Build and push (multi-stage Dockerfile)
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          push: true
+          build-args: APP_VERSION=${{ github.sha }}
+          tags: |
+            ${{ steps.meta.outputs.image }}
+            ${{ steps.login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ------------------------------------------------------------------ 3
+  terraform:
+    name: Terraform apply (infrastructure)
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    outputs:
+      instance_id: ${{ steps.out.outputs.instance_id }}
+      app_url: ${{ steps.out.outputs.app_url }}
+    defaults:
+      run:
+        working-directory: terraform
+    env:
+      TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+      TF_VAR_aws_region: ${{ vars.AWS_REGION || 'af-south-1' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+      - name: Terraform init (S3 remote backend)
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}"
+      - run: terraform fmt -check -recursive
+      - run: terraform validate
+      - run: terraform plan -input=false -out=tfplan
+      - name: Terraform apply
+        run: terraform apply -input=false -auto-approve tfplan
+      - id: out
+        run: |
+          echo "instance_id=$(terraform output -raw instance_id)" >> "$GITHUB_OUTPUT"
+          echo "app_url=$(terraform output -raw app_url)" >> "$GITHUB_OUTPUT"
+
+  # ------------------------------------------------------------------ 4
+  deploy:
+    name: Deploy container to EC2 (with auto-rollback)
+    needs: [build-and-push, terraform]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Wait for the instance to register with SSM
+        run: |
+          for i in $(seq 1 30); do
+            n=$(aws ssm describe-instance-information \
+                 --filters "Key=InstanceIds,Values=${{ needs.terraform.outputs.instance_id }}" \
+                 --query 'length(InstanceInformationList)' --output text)
+            [ "$n" = "1" ] && exit 0
+            echo "waiting for SSM agent ($i/30)"; sleep 10
+          done
+          echo "Instance never registered with SSM"; exit 1
+
+      - name: Send deploy script via SSM Run Command
+        id: send
+        run: |
+          SCRIPT=$(base64 -w0 scripts/deploy.sh)
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "${{ needs.terraform.outputs.instance_id }}" \
+            --document-name AWS-RunShellScript \
+            --comment "deploy ${GITHUB_SHA::7}" \
+            --parameters "commands=[\"until [ -f /opt/app/host.env ] && systemctl is-active docker; do sleep 5; done\",\"echo $SCRIPT | base64 -d > /opt/app/deploy.sh\",\"chmod +x /opt/app/deploy.sh\",\"/opt/app/deploy.sh ${{ needs.build-and-push.outputs.image }} ${{ vars.ENABLE_FAULT_ENDPOINT || 'false' }}\"]" \
+            --query Command.CommandId --output text)
+          echo "command_id=$CMD_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for deploy result
+        run: |
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "${{ steps.send.outputs.command_id }}" \
+              --instance-id "${{ needs.terraform.outputs.instance_id }}" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in Pending|InProgress|Delayed) sleep 10 ;; *) break ;; esac
+          done
+          aws ssm get-command-invocation \
+            --command-id "${{ steps.send.outputs.command_id }}" \
+            --instance-id "${{ needs.terraform.outputs.instance_id }}" \
+            --query '{Status:Status,Output:StandardOutputContent,Errors:StandardErrorContent}' \
+            --output json | tee result.json
+          [ "$(jq -r .Status result.json)" = "Success" ] || { echo "::error::Deploy failed (auto-rollback was attempted)"; exit 1; }
+
+      - name: Smoke test through the load balancer
+        run: |
+          URL="${{ needs.terraform.outputs.app_url }}/health"
+          for i in $(seq 1 20); do
+            if curl -fsS -m 5 "$URL"; then echo; echo "Smoke test passed"; exit 0; fi
+            echo "retry $i/20"; sleep 10
+          done
+          echo "::error::Smoke test failed"; exit 1

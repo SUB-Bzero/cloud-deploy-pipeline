@@ -1,0 +1,22 @@
+$ flake8 && echo "flake8: no issues"
+flake8: no issues
+
+$ pytest -v
+============================= test session starts ==============================
+platform linux -- Python 3.13.14, pytest-9.0.3, pluggy-1.6.0 -- /usr/local/bin/python
+cachedir: .pytest_cache
+rootdir: /home/user/cloud-deploy-pipeline/app
+configfile: pytest.ini
+testpaths: tests
+plugins: anyio-4.14.2
+collecting ... collected 7 items
+
+tests/test_app.py::test_index_ok PASSED                                  [ 14%]
+tests/test_app.py::test_health_ok PASSED                                 [ 28%]
+tests/test_app.py::test_health_returns_503_when_db_down PASSED           [ 42%]
+tests/test_app.py::test_create_and_list_notes PASSED                     [ 57%]
+tests/test_app.py::test_create_note_validation PASSED                    [ 71%]
+tests/test_app.py::test_fault_endpoint_disabled_by_default PASSED        [ 85%]
+tests/test_app.py::test_fault_endpoint_enabled PASSED                    [100%]
+
+============================== 7 passed ===============================

@@ -1,0 +1,21 @@
+$ deploy.sh .../capstone-app:v1-good      # first release
+>> Logging in to ECR (123.dkr.ecr.af-south-1.amazonaws.com)
+>> Pulling 123.dkr.ecr.af-south-1.amazonaws.com/capstone-app:v1-good
+>> Starting new version
+docker: started 123.dkr.ecr.af-south-1.amazonaws.com/capstone-app:v1-good
+>> SUCCESS: 123.dkr.ecr.af-south-1.amazonaws.com/capstone-app:v1-good is healthy
+[exit code 0]
+
+$ deploy.sh .../capstone-app:v2-bad       # broken release
+>> Logging in to ECR (123.dkr.ecr.af-south-1.amazonaws.com)
+>> Pulling 123.dkr.ecr.af-south-1.amazonaws.com/capstone-app:v2-bad
+>> Starting new version
+docker: started 123.dkr.ecr.af-south-1.amazonaws.com/capstone-app:v2-bad
+!! New version FAILED health check
+Traceback: simulated crash on startup
+>> ROLLING BACK to 123.dkr.ecr.af-south-1.amazonaws.com/capstone-app:v1-good
+docker: started 123.dkr.ecr.af-south-1.amazonaws.com/capstone-app:v1-good
+>> Rollback complete - previous version is serving traffic
+[exit code 1]
+
+Container now running: 123.dkr.ecr.af-south-1.amazonaws.com/capstone-app:v1-good

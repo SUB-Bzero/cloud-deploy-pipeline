@@ -1,0 +1,9 @@
+variable "name" { type = string }
+variable "instance_type" { type = string }
+variable "vpc_id" { type = string }
+variable "public_subnet_ids" { type = list(string) }
+variable "app_sg_id" { type = string }
+variable "alb_sg_id" { type = string }
+variable "aws_region" { type = string }
+variable "db_url_param_name" { type = string }
+variable "db_url_param_arn" { type = string }
